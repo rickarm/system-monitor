@@ -1,15 +1,26 @@
 """Deterministic health checks for Mac mini services."""
 
 import http.client
+import json
 import re
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 HOME = Path.home()
 SLEEP_WATCHER_LOG = HOME / "Library/Logs/sleep-watcher.log"
 PELOTON_SYNC_LOG = HOME / "scripts/logs/peloton-sync.log"
 GIT_PULL_LOG = HOME / "scripts/logs/git-pull-repos.log"
+OPENCLAW_LOG = HOME / "scripts/logs/openclaw.log"
+OPENCLAW_KILL_MARKER = HOME / "scripts/logs/openclaw-killed.marker"
+
+OPENCLAW_FORMAT_ERROR_THRESHOLD = 6
+OPENCLAW_QUOTA_FAILOVER_THRESHOLD = 4
+OPENCLAW_SCAN_WINDOW_MINUTES = 60
+
+RE_TIMESTAMP = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.\d+([+-]\d{2}:\d{2})")
+RE_FORMAT_ERROR = re.compile(r"embedded run agent end.*isError=true.*gpt-5\.4-pro.*reasoning.*item")
+RE_QUOTA_FAILOVER = re.compile(r"candidate_failed.*reason=rate_limit.*next=openai/gpt-5\.4-pro")
 
 SERVICE_CONTEXT = {
     "sherlock-hq": "FastAPI dashboard (port 8300)",
@@ -198,6 +209,86 @@ def check_git_pull_repos() -> dict:
         return ok(f"Last run {last_ts_str}: failed=0")
     except OSError as e:
         return degraded(f"Could not read git-pull-repos log: {e}")
+
+
+def _parse_ts(line: str) -> datetime | None:
+    m = RE_TIMESTAMP.match(line)
+    if not m:
+        return None
+    try:
+        raw = m.group(1) + m.group(2)
+        return datetime.strptime(raw, "%Y-%m-%dT%H:%M:%S%z")
+    except ValueError:
+        return None
+
+
+def _read_recent_lines(path: Path, window_minutes: int) -> list[str]:
+    """Read lines from the end of the file within the time window."""
+    if not path.exists():
+        return []
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+        lines = path.read_text(errors="replace").splitlines()
+        recent = []
+        for line in reversed(lines):
+            ts = _parse_ts(line)
+            if ts is not None and ts < cutoff:
+                break
+            recent.append(line)
+        recent.reverse()
+        return recent
+    except OSError:
+        return []
+
+
+def check_openclaw_token_health() -> dict:
+    # Check kill marker first
+    if OPENCLAW_KILL_MARKER.exists():
+        try:
+            marker = json.loads(OPENCLAW_KILL_MARKER.read_text())
+            reason = marker.get("reason", "unknown")
+            killed_at = marker.get("killed_at", "unknown")
+            return {
+                "status": "killed",
+                "detail": f"Watchdog killed OpenClaw at {killed_at} — {reason}",
+                "fix": "rm ~/scripts/logs/openclaw-killed.marker && ~/scripts/start-openclaw.sh",
+            }
+        except (json.JSONDecodeError, OSError):
+            return {
+                "status": "killed",
+                "detail": "Kill marker present but unreadable",
+                "fix": "rm ~/scripts/logs/openclaw-killed.marker && ~/scripts/start-openclaw.sh",
+            }
+
+    recent = _read_recent_lines(OPENCLAW_LOG, OPENCLAW_SCAN_WINDOW_MINUTES)
+
+    format_errors = [l for l in recent if RE_FORMAT_ERROR.search(l)]
+    quota_failovers = [l for l in recent if RE_QUOTA_FAILOVER.search(l)]
+
+    counts = {
+        "format_error_loop": len(format_errors),
+        "quota_failover_cascade": len(quota_failovers),
+    }
+
+    if len(format_errors) >= OPENCLAW_FORMAT_ERROR_THRESHOLD:
+        return {
+            "status": "kill",
+            "detail": f"{len(format_errors)} gpt-5.4-pro format error retries in {OPENCLAW_SCAN_WINDOW_MINUTES} min",
+            "reason": "format_error_loop",
+            "pattern_counts": counts,
+            "log_excerpts": format_errors[-10:],
+        }
+
+    if len(quota_failovers) >= OPENCLAW_QUOTA_FAILOVER_THRESHOLD:
+        return {
+            "status": "kill",
+            "detail": f"{len(quota_failovers)} quota-triggered failovers to gpt-5.4-pro in {OPENCLAW_SCAN_WINDOW_MINUTES} min",
+            "reason": "quota_failover_cascade",
+            "pattern_counts": counts,
+            "log_excerpts": quota_failovers[-10:],
+        }
+
+    return ok(f"{counts['format_error_loop']} format errors, {counts['quota_failover_cascade']} quota failovers in last {OPENCLAW_SCAN_WINDOW_MINUTES} min")
 
 
 CHECKS = {

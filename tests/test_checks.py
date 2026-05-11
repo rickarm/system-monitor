@@ -1,5 +1,6 @@
 """Tests for deterministic health checks."""
 
+import json
 import textwrap
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -7,9 +8,11 @@ from checks import (
     check_sherlock_hq,
     check_sleep_watcher,
     check_openclaw,
+    check_openclaw_token_health,
     check_peloton_sync,
     check_git_pull_repos,
     CHECKS,
+    OPENCLAW_KILL_MARKER,
 )
 
 
@@ -130,3 +133,98 @@ def test_git_pull_failures(tmp_path):
         result = check_git_pull_repos()
     assert result["status"] == "degraded"
     assert "1" in result["detail"]
+
+
+def test_openclaw_token_health_clean(tmp_path):
+    log = tmp_path / "openclaw.log"
+    from datetime import datetime, timezone
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000-07:00")
+    log.write_text(f"{ts} [gateway] ready\n{ts} [heartbeat] started\n")
+    with patch("checks.OPENCLAW_LOG", log), patch("checks.OPENCLAW_KILL_MARKER", tmp_path / "no.marker"):
+        result = check_openclaw_token_health()
+    assert result["status"] == "healthy"
+
+
+def test_openclaw_token_health_no_log(tmp_path):
+    with patch("checks.OPENCLAW_LOG", tmp_path / "nope.log"), patch("checks.OPENCLAW_KILL_MARKER", tmp_path / "no.marker"):
+        result = check_openclaw_token_health()
+    assert result["status"] == "healthy"
+
+
+def test_openclaw_token_health_format_errors(tmp_path):
+    log = tmp_path / "openclaw.log"
+    from datetime import datetime, timezone
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000-07:00")
+    line = (f"{ts} [agent/embedded] embedded run agent end: runId=abc "
+            f"isError=true model=gpt-5.4-pro provider=openai "
+            f"error=LLM request failed rawError=400 Item 'msg_abc' "
+            f"of type 'message' was provided without its required "
+            f"'reasoning' item: 'rs_abc'.\n")
+    log.write_text(line * 7)
+    with patch("checks.OPENCLAW_LOG", log), patch("checks.OPENCLAW_KILL_MARKER", tmp_path / "no.marker"):
+        result = check_openclaw_token_health()
+    assert result["status"] == "kill"
+    assert result["reason"] == "format_error_loop"
+    assert result["pattern_counts"]["format_error_loop"] == 7
+
+
+def test_openclaw_token_health_below_threshold(tmp_path):
+    log = tmp_path / "openclaw.log"
+    from datetime import datetime, timezone
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000-07:00")
+    line = (f"{ts} [agent/embedded] embedded run agent end: runId=abc "
+            f"isError=true model=gpt-5.4-pro provider=openai "
+            f"error=LLM request failed rawError=400 Item 'msg_abc' "
+            f"of type 'message' was provided without its required "
+            f"'reasoning' item: 'rs_abc'.\n")
+    log.write_text(line * 3)
+    with patch("checks.OPENCLAW_LOG", log), patch("checks.OPENCLAW_KILL_MARKER", tmp_path / "no.marker"):
+        result = check_openclaw_token_health()
+    assert result["status"] == "healthy"
+
+
+def test_openclaw_token_health_quota_failover(tmp_path):
+    log = tmp_path / "openclaw.log"
+    from datetime import datetime, timezone
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000-07:00")
+    line = (f"{ts} [model-fallback/decision] model fallback decision: "
+            f"decision=candidate_failed requested=openai/gpt-5.4-nano "
+            f"candidate=openai/gpt-5.4-nano reason=rate_limit "
+            f"next=openai/gpt-5.4-pro detail=quota exceeded\n")
+    log.write_text(line * 5)
+    with patch("checks.OPENCLAW_LOG", log), patch("checks.OPENCLAW_KILL_MARKER", tmp_path / "no.marker"):
+        result = check_openclaw_token_health()
+    assert result["status"] == "kill"
+    assert result["reason"] == "quota_failover_cascade"
+    assert result["pattern_counts"]["quota_failover_cascade"] == 5
+
+
+def test_openclaw_token_health_old_errors(tmp_path):
+    log = tmp_path / "openclaw.log"
+    old_ts = "2020-01-01T00:00:00.000-07:00"
+    line = (f"{old_ts} [agent/embedded] embedded run agent end: runId=abc "
+            f"isError=true model=gpt-5.4-pro provider=openai "
+            f"error=LLM request failed rawError=400 Item 'msg_abc' "
+            f"of type 'message' was provided without its required "
+            f"'reasoning' item: 'rs_abc'.\n")
+    log.write_text(line * 10)
+    with patch("checks.OPENCLAW_LOG", log), patch("checks.OPENCLAW_KILL_MARKER", tmp_path / "no.marker"):
+        result = check_openclaw_token_health()
+    assert result["status"] == "healthy"
+
+
+def test_openclaw_token_health_killed_marker(tmp_path):
+    log = tmp_path / "openclaw.log"
+    log.write_text("")
+    marker = tmp_path / "openclaw-killed.marker"
+    marker.write_text(json.dumps({
+        "killed_at": "2026-05-08T14:40:00+00:00",
+        "reason": "format_error_loop",
+        "detail": "8 gpt-5.4-pro format error retries in 60 min",
+        "pattern_counts": {"format_error_loop": 8, "quota_failover_cascade": 3},
+    }))
+    with patch("checks.OPENCLAW_LOG", log), patch("checks.OPENCLAW_KILL_MARKER", marker):
+        result = check_openclaw_token_health()
+    assert result["status"] == "killed"
+    assert "format_error_loop" in result["detail"]
+    assert "fix" in result
