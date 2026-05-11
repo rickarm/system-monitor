@@ -5,3 +5,4 @@ __pycache__/
 .env
 *.json
 *.log
+.DS_Store
