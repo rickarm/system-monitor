@@ -17,11 +17,18 @@ from checks import (
 
 
 def test_checks_registry():
-    assert len(CHECKS) == 5
+    assert len(CHECKS) == 6
     assert set(CHECKS.keys()) == {
-        "sherlock-hq", "sleep-watcher", "openclaw",
+        "openclaw-tokens", "sherlock-hq", "sleep-watcher", "openclaw",
         "peloton-sync", "git-pull-repos",
     }
+
+
+def test_checks_registry_with_token_watchdog():
+    assert len(CHECKS) == 6
+    keys = list(CHECKS.keys())
+    assert "openclaw-tokens" in keys
+    assert keys.index("openclaw-tokens") < keys.index("openclaw")
 
 
 @patch("checks.http.client.HTTPConnection")
@@ -211,6 +218,21 @@ def test_openclaw_token_health_old_errors(tmp_path):
     with patch("checks.OPENCLAW_LOG", log), patch("checks.OPENCLAW_KILL_MARKER", tmp_path / "no.marker"):
         result = check_openclaw_token_health()
     assert result["status"] == "healthy"
+
+
+def test_openclaw_killed_marker_process_check(tmp_path):
+    marker = tmp_path / "openclaw-killed.marker"
+    marker.write_text(json.dumps({
+        "killed_at": "2026-05-08T14:40:00+00:00",
+        "reason": "format_error_loop",
+        "detail": "test",
+        "pattern_counts": {},
+    }))
+    with patch("checks.OPENCLAW_KILL_MARKER", marker):
+        result = check_openclaw()
+    assert result["status"] == "killed"
+    assert "format_error_loop" in result["detail"]
+    assert "fix" in result
 
 
 def test_openclaw_token_health_killed_marker(tmp_path):

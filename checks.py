@@ -23,6 +23,7 @@ RE_FORMAT_ERROR = re.compile(r"embedded run agent end.*isError=true.*gpt-5\.4-pr
 RE_QUOTA_FAILOVER = re.compile(r"candidate_failed.*reason=rate_limit.*next=openai/gpt-5\.4-pro")
 
 SERVICE_CONTEXT = {
+    "openclaw-tokens": "OpenClaw token budget watchdog",
     "sherlock-hq": "FastAPI dashboard (port 8300)",
     "sleep-watcher": "Oura / Airtable sync daemon",
     "openclaw": "Mandy Telegram bot agent",
@@ -109,6 +110,23 @@ def check_sleep_watcher() -> dict:
 
 
 def check_openclaw() -> dict:
+    # If watchdog killed OpenClaw, report killed status
+    if OPENCLAW_KILL_MARKER.exists():
+        try:
+            marker = json.loads(OPENCLAW_KILL_MARKER.read_text())
+            reason = marker.get("reason", "unknown")
+            killed_at = marker.get("killed_at", "unknown")
+            return {
+                "status": "killed",
+                "detail": f"Watchdog killed at {killed_at} — {reason}",
+                "fix": "rm ~/scripts/logs/openclaw-killed.marker && ~/scripts/start-openclaw.sh",
+            }
+        except (json.JSONDecodeError, OSError):
+            return {
+                "status": "killed",
+                "detail": "Kill marker present but unreadable",
+                "fix": "rm ~/scripts/logs/openclaw-killed.marker && ~/scripts/start-openclaw.sh",
+            }
     try:
         result = subprocess.run(
             ["launchctl", "list", "com.rickarmbrust.openclaw"],
@@ -292,6 +310,7 @@ def check_openclaw_token_health() -> dict:
 
 
 CHECKS = {
+    "openclaw-tokens": check_openclaw_token_health,
     "sherlock-hq": check_sherlock_hq,
     "sleep-watcher": check_sleep_watcher,
     "openclaw": check_openclaw,
