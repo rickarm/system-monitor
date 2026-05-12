@@ -1,8 +1,10 @@
 """Tests for main system_monitor module."""
 
+import json
 from datetime import datetime
 from pathlib import Path
-from system_monitor import load_env, fallback_alert
+from unittest.mock import patch, MagicMock
+from system_monitor import load_env, fallback_alert, send_alfred_alert, create_github_issue, execute_kill
 
 
 def test_load_env_missing_file(tmp_path):
@@ -89,3 +91,104 @@ def test_fallback_alert_multiple():
     result = fallback_alert(transitions)
     assert "a" in result
     assert "b" in result
+
+
+@patch("system_monitor.urllib.request.urlopen")
+def test_alfred_alert_success(mock_urlopen):
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = b'{"ok":true,"telegram_message_id":123}'
+    mock_resp.__enter__ = lambda s: s
+    mock_resp.__exit__ = MagicMock(return_value=False)
+    mock_urlopen.return_value = mock_resp
+    result = send_alfred_alert(
+        alfred_url="http://localhost:8200",
+        alfred_api_key="test-key",
+        service="openclaw",
+        transition="ok->down",
+        detail="test kill",
+    )
+    assert result is True
+
+
+@patch("system_monitor.send_telegram")
+@patch("system_monitor.urllib.request.urlopen")
+def test_alfred_alert_fallback(mock_urlopen, mock_send_tg):
+    mock_urlopen.side_effect = ConnectionRefusedError("refused")
+    mock_send_tg.return_value = True
+    result = send_alfred_alert(
+        alfred_url="http://localhost:8200",
+        alfred_api_key="test-key",
+        service="openclaw",
+        transition="ok->down",
+        detail="test kill",
+        fallback_token="bot-token",
+        fallback_chat_id="12345",
+    )
+    assert result is True
+    mock_send_tg.assert_called_once()
+
+
+@patch("system_monitor.subprocess.run")
+def test_github_issue_creation(mock_run):
+    mock_run.return_value = MagicMock(returncode=0, stdout="https://github.com/rickarm/system-monitor/issues/1\n")
+    result = create_github_issue(
+        reason="format_error_loop",
+        detail="8 errors in 60 min",
+        log_excerpts=["line1", "line2"],
+        marker_contents={"killed_at": "2026-05-08T14:40:00"},
+    )
+    assert result is True
+    args = mock_run.call_args[0][0]
+    assert "gh" in args
+    assert "issue" in args
+    assert "create" in args
+
+
+@patch("system_monitor.subprocess.run")
+def test_github_issue_failure_nonfatal(mock_run):
+    mock_run.side_effect = FileNotFoundError("gh not found")
+    result = create_github_issue(
+        reason="format_error_loop",
+        detail="8 errors",
+        log_excerpts=[],
+        marker_contents={},
+    )
+    assert result is False
+
+
+@patch("system_monitor.create_github_issue", return_value=True)
+@patch("system_monitor.send_alfred_alert", return_value=True)
+@patch("system_monitor.subprocess.run")
+def test_kill_mechanism_stop_and_pkill(mock_run, mock_alert, mock_issue, tmp_path):
+    mock_run.return_value = MagicMock(returncode=0)
+    marker_path = tmp_path / "openclaw-killed.marker"
+    env = {
+        "ALFRED_URL": "http://localhost:8200",
+        "ALFRED_API_KEY": "key",
+    }
+    check_result = {
+        "status": "kill",
+        "detail": "8 format errors in 60 min",
+        "reason": "format_error_loop",
+        "pattern_counts": {"format_error_loop": 8, "quota_failover_cascade": 0},
+        "log_excerpts": ["line1"],
+    }
+
+    with patch("system_monitor.OPENCLAW_KILL_MARKER", marker_path):
+        execute_kill(check_result, env)
+
+    # Verify stop script called
+    calls = [str(c) for c in mock_run.call_args_list]
+    assert any("stop-openclaw" in c for c in calls)
+    assert any("pkill" in c for c in calls)
+
+    # Verify marker written
+    assert marker_path.exists()
+    marker = json.loads(marker_path.read_text())
+    assert marker["reason"] == "format_error_loop"
+
+    # Verify alert sent
+    mock_alert.assert_called_once()
+
+    # Verify issue created
+    mock_issue.assert_called_once()

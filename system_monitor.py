@@ -12,12 +12,16 @@ Usage:
 """
 
 import argparse
+import json
 import logging
+import subprocess
 import sys
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
-from checks import CHECKS, SERVICE_CONTEXT
+from checks import CHECKS, SERVICE_CONTEXT, OPENCLAW_KILL_MARKER
 from state import load_state, save_state
 from telegram import send_telegram
 from reasoning import reason_sync
@@ -70,6 +74,154 @@ def fallback_alert(transitions: list[dict]) -> str:
         lines.append("")
     lines.append(f"<i>{datetime.now().strftime('%Y-%m-%d %H:%M')}</i>")
     return "\n".join(lines)
+
+
+def send_alfred_alert(
+    alfred_url: str,
+    alfred_api_key: str,
+    service: str,
+    transition: str,
+    detail: str,
+    fallback_token: str = "",
+    fallback_chat_id: str = "",
+) -> bool:
+    """Send alert via Alfred, fall back to direct Telegram."""
+    url = f"{alfred_url.rstrip('/')}/alert"
+    payload = json.dumps({
+        "service": service,
+        "transition": transition,
+        "detail": detail,
+    }).encode()
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {alfred_api_key}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            if data.get("ok"):
+                log.info("Alert sent via Alfred")
+                return True
+            log.warning("Alfred returned error: %s", data)
+    except Exception as e:
+        log.warning("Alfred unreachable (%s), trying direct Telegram", e)
+
+    if fallback_token and fallback_chat_id:
+        msg = f"🔴 WATCHDOG KILL: {service}\n{detail}"
+        return send_telegram(fallback_token, fallback_chat_id, msg)
+
+    log.error("No fallback Telegram credentials — alert not sent")
+    return False
+
+
+def create_github_issue(
+    reason: str,
+    detail: str,
+    log_excerpts: list[str],
+    marker_contents: dict,
+) -> bool:
+    """Create a GitHub issue for investigation. Returns False on failure (non-fatal)."""
+    title = f"OpenClaw token watchdog kill: {reason}"
+    body_lines = [
+        f"## Watchdog Kill Report",
+        f"",
+        f"**Reason:** {reason}",
+        f"**Detail:** {detail}",
+        f"**Killed at:** {marker_contents.get('killed_at', 'unknown')}",
+        f"",
+        f"### Pattern Counts",
+        f"```json",
+        json.dumps(marker_contents.get("pattern_counts", {}), indent=2),
+        f"```",
+        f"",
+        f"### Log Excerpts (last {len(log_excerpts)})",
+        f"```",
+        *log_excerpts[-10:],
+        f"```",
+        f"",
+        f"### Action Required",
+        f"1. Check OpenAI billing/quota status",
+        f"2. Inspect session files for Anthropic reasoning item contamination",
+        f"3. Clear contaminated session if needed",
+        f"4. Restart: `rm ~/scripts/logs/openclaw-killed.marker && ~/scripts/start-openclaw.sh`",
+    ]
+    body = "\n".join(body_lines)
+    try:
+        result = subprocess.run(
+            ["gh", "issue", "create",
+             "--repo", "rickarm/system-monitor",
+             "--title", title,
+             "--body", body],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            log.info("GitHub issue created: %s", result.stdout.strip())
+            return True
+        log.warning("gh issue create failed (exit %d): %s", result.returncode, result.stderr)
+        return False
+    except Exception as e:
+        log.warning("Could not create GitHub issue: %s", e)
+        return False
+
+
+def execute_kill(check_result: dict, env: dict) -> None:
+    """Execute the full kill mechanism: stop, pkill, marker, alert, issue."""
+    reason = check_result["reason"]
+    detail = check_result["detail"]
+    log_excerpts = check_result.get("log_excerpts", [])
+
+    log.warning("TOKEN WATCHDOG: Killing OpenClaw — %s", detail)
+
+    # Stop and unload
+    try:
+        subprocess.run(
+            [str(HOME / "scripts/stop-openclaw.sh")],
+            capture_output=True, text=True, timeout=15,
+        )
+        log.info("OpenClaw stop script executed")
+    except Exception as e:
+        log.error("Failed to run stop script: %s", e)
+
+    # Kill orphaned gateway processes
+    try:
+        subprocess.run(
+            ["pkill", "-f", "openclaw-gateway"],
+            capture_output=True, timeout=5,
+        )
+    except Exception:
+        pass  # pkill returns non-zero if no matches — that's fine
+
+    # Write kill marker
+    marker_contents = {
+        "killed_at": datetime.now(timezone.utc).isoformat(),
+        "reason": reason,
+        "detail": detail,
+        "pattern_counts": check_result.get("pattern_counts", {}),
+    }
+    try:
+        OPENCLAW_KILL_MARKER.write_text(json.dumps(marker_contents, indent=2))
+        log.info("Kill marker written to %s", OPENCLAW_KILL_MARKER)
+    except OSError as e:
+        log.error("Failed to write kill marker: %s", e)
+
+    # Alert via Alfred
+    send_alfred_alert(
+        alfred_url=env.get("ALFRED_URL", "http://127.0.0.1:8200"),
+        alfred_api_key=env.get("ALFRED_API_KEY", ""),
+        service="openclaw",
+        transition="ok->down",
+        detail=f"TOKEN WATCHDOG KILL: {detail}. Service unloaded from launchd. Manual restart required: rm ~/scripts/logs/openclaw-killed.marker && ~/scripts/start-openclaw.sh",
+        fallback_token=env.get("RICK_TELEGRAM_BOT_TOKEN", ""),
+        fallback_chat_id=env.get("RICK_TELEGRAM_CHAT_ID", ""),
+    )
+
+    # Create GitHub issue
+    create_github_issue(reason, detail, log_excerpts, marker_contents)
 
 
 def main(dry_run: bool = False) -> None:
