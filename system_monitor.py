@@ -63,11 +63,19 @@ def fallback_alert(transitions: list[dict]) -> str:
     """Format a basic alert when Claude reasoning is unavailable."""
     lines = []
     for t in transitions:
-        icon = "🔴" if t["new_status"] == "degraded" else "🟢"
-        direction = "DEGRADED" if t["new_status"] == "degraded" else "RECOVERED"
+        new = t["new_status"]
+        if new in ("kill", "killed"):
+            icon = "🔴"
+            direction = "WATCHDOG KILL"
+        elif new == "degraded":
+            icon = "🔴"
+            direction = "DEGRADED"
+        else:
+            icon = "🟢"
+            direction = "RECOVERED"
         lines.append(f"{icon} <b>{direction}: {t['service']}</b>")
         lines.append(f"<i>{t['context']}</i>")
-        lines.append(f"{t['old_status']} → {t['new_status']}")
+        lines.append(f"{t['old_status']} → {new}")
         lines.append(t["detail"])
         if t.get("fix"):
             lines.append(f"<b>Fix:</b> <code>{t['fix']}</code>")
@@ -245,6 +253,17 @@ def main(dry_run: bool = False) -> None:
         log.info("Checking %s...", name)
         result = check_fn()
         new_status = result["status"]
+
+        # Handle kill status: execute kill, persist as "killed"
+        if new_status == "kill" and not dry_run:
+            execute_kill(result, env)
+            new_status = "killed"
+            result["status"] = "killed"
+        elif new_status == "kill" and dry_run:
+            print(f"\n[DRY-RUN] Would execute kill: {result['detail']}")
+            new_status = "killed"
+            result["status"] = "killed"
+
         new_services[name] = {
             "status": new_status,
             "detail": result["detail"],
@@ -255,7 +274,7 @@ def main(dry_run: bool = False) -> None:
         prev = prev_services.get(name, {})
         old_status = prev.get("status", "unknown")
 
-        status_symbol = "OK  " if new_status == "healthy" else "WARN"
+        status_symbol = "OK  " if new_status == "healthy" else ("KILL" if new_status in ("kill", "killed") else "WARN")
         log.info("[%s] %-16s %s — %s", status_symbol, name, new_status, result["detail"][:80])
 
         if old_status == new_status:

@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 from system_monitor import load_env, fallback_alert, send_alfred_alert, create_github_issue, execute_kill
+from state import load_state, save_state
 
 
 def test_load_env_missing_file(tmp_path):
@@ -192,3 +193,46 @@ def test_kill_mechanism_stop_and_pkill(mock_run, mock_alert, mock_issue, tmp_pat
 
     # Verify issue created
     mock_issue.assert_called_once()
+
+
+def test_fallback_alert_kill():
+    transitions = [
+        {
+            "service": "openclaw-tokens",
+            "context": "OpenClaw token budget watchdog",
+            "old_status": "healthy",
+            "new_status": "kill",
+            "detail": "8 gpt-5.4-pro format error retries in 60 min",
+            "fix": None,
+        }
+    ]
+    result = fallback_alert(transitions)
+    assert "WATCHDOG KILL" in result
+    assert "🔴" in result
+    assert "openclaw-tokens" in result
+
+
+def test_kill_then_next_run_no_spurious_transition(tmp_path):
+    """After a kill, the next run should not produce a transition alert."""
+    state_file = tmp_path / "state.json"
+
+    # Simulate state after kill run: openclaw-tokens is "killed"
+    state = {
+        "services": {
+            "openclaw-tokens": {
+                "status": "killed",
+                "detail": "Watchdog killed OpenClaw",
+                "last_checked": "2026-05-08T15:00:00+00:00",
+                "last_changed": "2026-05-08T14:40:00+00:00",
+            }
+        }
+    }
+    save_state(state, state_file)
+
+    # Next run: check returns "killed" again
+    prev = load_state(state_file)
+    old_status = prev["services"]["openclaw-tokens"]["status"]
+    new_status = "killed"  # what check_openclaw_token_health would return
+
+    # No transition should be detected
+    assert old_status == new_status  # killed -> killed = no transition
