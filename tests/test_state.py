@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 from state import load_state, save_state
 
 

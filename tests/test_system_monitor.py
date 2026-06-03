@@ -1,8 +1,6 @@
 """Tests for main system_monitor module."""
 
 import json
-from datetime import datetime
-from pathlib import Path
 from unittest.mock import patch, MagicMock
 from system_monitor import load_env, fallback_alert, send_alfred_alert, create_github_issue, execute_kill
 from state import load_state, save_state

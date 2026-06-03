@@ -2,7 +2,6 @@
 
 import json
 import textwrap
-from pathlib import Path
 from unittest.mock import patch, MagicMock
 from checks import (
     check_sherlock_hq,
@@ -12,7 +11,6 @@ from checks import (
     check_peloton_sync,
     check_git_pull_repos,
     CHECKS,
-    OPENCLAW_KILL_MARKER,
 )
 
 

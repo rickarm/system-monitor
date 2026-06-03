@@ -218,7 +218,7 @@ def check_git_pull_repos() -> dict:
 
         failed_count = int(done_match.group(1))
         if failed_count > 0:
-            fail_lines = [l.strip() for l in last_block.splitlines() if "FAIL" in l or "ERROR" in l]
+            fail_lines = [line.strip() for line in last_block.splitlines() if "FAIL" in line or "ERROR" in line]
             detail = f"{failed_count} repo(s) failed. " + (fail_lines[0][:80] if fail_lines else "")
             return degraded(detail, fix="cd ~/Dev/<failing-repo> && git pull")
 
@@ -280,8 +280,8 @@ def check_openclaw_token_health() -> dict:
 
     recent = _read_recent_lines(OPENCLAW_LOG, OPENCLAW_SCAN_WINDOW_MINUTES)
 
-    format_errors = [l for l in recent if RE_FORMAT_ERROR.search(l)]
-    quota_failovers = [l for l in recent if RE_QUOTA_FAILOVER.search(l)]
+    format_errors = [line for line in recent if RE_FORMAT_ERROR.search(line)]
+    quota_failovers = [line for line in recent if RE_QUOTA_FAILOVER.search(line)]
 
     counts = {
         "format_error_loop": len(format_errors),
