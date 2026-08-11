@@ -119,32 +119,48 @@ def check_openclaw() -> dict:
             return {
                 "status": "killed",
                 "detail": f"Watchdog killed at {killed_at} — {reason}",
-                "fix": "rm ~/scripts/logs/openclaw-killed.marker && ~/scripts/start-openclaw.sh",
+                "fix": "rm ~/scripts/logs/openclaw-killed.marker && ~/Dev/openclaw-config/scripts/start-openclaw.sh",
             }
         except (json.JSONDecodeError, OSError):
             return {
                 "status": "killed",
                 "detail": "Kill marker present but unreadable",
-                "fix": "rm ~/scripts/logs/openclaw-killed.marker && ~/scripts/start-openclaw.sh",
+                "fix": "rm ~/scripts/logs/openclaw-killed.marker && ~/Dev/openclaw-config/scripts/start-openclaw.sh",
             }
+    # Mandy's gateway is supervised by ONE of these two launchd labels, and which one
+    # changes with the A2 migration (our custom plist -> OpenClaw's native service).
+    # Checking both, and accepting whichever is loaded, keeps this monitor correct on
+    # either side of that flip with no coordinated deploy. A hardcoded label would fail
+    # silently: `launchctl list <dead-label>` simply returns non-zero, which this function
+    # reports as "not loaded" — i.e. a healthy Mandy would be alarmed as down, or worse,
+    # a real outage could be masked once the labels no longer line up.
+    labels = ["com.rickarmbrust.openclaw", "ai.openclaw.gateway"]
+    loaded_without_pid = []
     try:
-        result = subprocess.run(
-            ["launchctl", "list", "com.rickarmbrust.openclaw"],
-            capture_output=True, text=True, timeout=5,
+        for label in labels:
+            result = subprocess.run(
+                ["launchctl", "list", label],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                continue
+            if '"PID"' in result.stdout:
+                return ok(f"Loaded and process running ({label})")
+            loaded_without_pid.append(label)
+
+        if loaded_without_pid:
+            label = loaded_without_pid[0]
+            return degraded(
+                f"{label} loaded but process is not running (no PID)",
+                fix=f"launchctl kickstart -k gui/$(id -u)/{label}",
+            )
+        return degraded(
+            "no OpenClaw gateway service loaded in launchd (checked: "
+            + ", ".join(labels) + ")",
+            fix="~/Dev/openclaw-config/scripts/start-openclaw.sh",
         )
-        if result.returncode != 0:
-            return degraded(
-                "com.rickarmbrust.openclaw not loaded in launchd",
-                fix="launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.rickarmbrust.openclaw.plist",
-            )
-        if '"PID"' not in result.stdout:
-            return degraded(
-                "com.rickarmbrust.openclaw loaded but process is not running (no PID)",
-                fix="launchctl kickstart -k gui/$(id -u)/com.rickarmbrust.openclaw",
-            )
     except Exception as e:
         return degraded(f"launchctl check failed: {e}")
-    return ok("Loaded and process running")
 
 
 def check_peloton_sync() -> dict:
@@ -269,13 +285,13 @@ def check_openclaw_token_health() -> dict:
             return {
                 "status": "killed",
                 "detail": f"Watchdog killed OpenClaw at {killed_at} — {reason}",
-                "fix": "rm ~/scripts/logs/openclaw-killed.marker && ~/scripts/start-openclaw.sh",
+                "fix": "rm ~/scripts/logs/openclaw-killed.marker && ~/Dev/openclaw-config/scripts/start-openclaw.sh",
             }
         except (json.JSONDecodeError, OSError):
             return {
                 "status": "killed",
                 "detail": "Kill marker present but unreadable",
-                "fix": "rm ~/scripts/logs/openclaw-killed.marker && ~/scripts/start-openclaw.sh",
+                "fix": "rm ~/scripts/logs/openclaw-killed.marker && ~/Dev/openclaw-config/scripts/start-openclaw.sh",
             }
 
     recent = _read_recent_lines(OPENCLAW_LOG, OPENCLAW_SCAN_WINDOW_MINUTES)
