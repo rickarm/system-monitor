@@ -19,8 +19,40 @@ OPENCLAW_QUOTA_FAILOVER_THRESHOLD = 4
 OPENCLAW_SCAN_WINDOW_MINUTES = 60
 
 RE_TIMESTAMP = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.\d+([+-]\d{2}:\d{2})")
-RE_FORMAT_ERROR = re.compile(r"embedded run agent end.*isError=true.*gpt-5\.4-pro.*reasoning.*item")
-RE_QUOTA_FAILOVER = re.compile(r"candidate_failed.*reason=rate_limit.*next=openai/gpt-5\.4-pro")
+# The gateway log gained a second line format on 2026-08-11 when `logging.file` was pointed
+# at it (native structured JSON sink, so the log survives a launchd service swap). Those
+# lines start with `{"0":...` and carry their timestamp in a "time" field, so the anchored
+# regex above cannot see them. Without this, _parse_ts returns None for every modern line,
+# _read_recent_lines never breaks out of its loop, and the "last 60 minutes" window silently
+# becomes "the entire file" — turning any historical match into a present-tense kill signal.
+RE_JSON_TIMESTAMP = re.compile(r'"time":"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.\d+([+-]\d{2}:\d{2})"')
+
+# Poison-pill loop: the agent retries a request the provider keeps rejecting, burning tokens
+# with no output. This is the real "runaway" signal and the only one worth killing over.
+# Deliberately MODEL-AGNOSTIC. The previous pattern hardcoded `gpt-5.4-pro`, which Mandy
+# stopped emitting when she moved to Anthropic on 2026-06-26, so the watchdog could not
+# match anything and was inert for ~6 weeks. Do not reintroduce a model name here.
+# Sample: embedded run agent end: runId=... isError=true model=claude-sonnet-4-6
+#         provider=anthropic error=LLM request failed: provider rejected the request schema
+#         or tool payload
+RE_POISON_LOOP = re.compile(
+    r"embedded run agent end.*isError=true.*provider rejected the request schema"
+)
+
+# Provider refusing us because the configured Console spend cap is reached. ALERT ONLY,
+# never kill: the provider has already stopped serving requests, so spend has stopped too
+# and killing Mandy saves nothing while costing Rick his assistant. There is also no
+# mini-side fix — raise the cap in the Anthropic Console or wait for the stated reset.
+# Sample: candidate_failed requested=anthropic/claude-sonnet-4-6 ... reason=rate_limit
+#         providerErrorType=invalid_request_error next=none detail=You have reached your
+#         specified API usage limits.
+RE_USAGE_CAP = re.compile(r"reason=rate_limit.*providerErrorType=invalid_request_error")
+
+# NOTE on the retired quota-failover check: it looked for cascading failover to a fallback
+# model (`next=openai/gpt-5.4-pro`). Mandy now runs with NO fallbacks configured, so real
+# log lines read `next=none` and a failover cascade is structurally impossible. Replaced by
+# RE_USAGE_CAP above rather than re-pointed. `reason=overloaded` is deliberately NOT matched
+# by anything here: it is the transient provider error and self-resolves.
 
 SERVICE_CONTEXT = {
     "openclaw-tokens": "OpenClaw token budget watchdog",
@@ -246,7 +278,8 @@ def check_git_pull_repos() -> dict:
 
 
 def _parse_ts(line: str) -> datetime | None:
-    m = RE_TIMESTAMP.match(line)
+    """Timestamp from either gateway log format: legacy console, or the JSON file sink."""
+    m = RE_TIMESTAMP.match(line) or RE_JSON_TIMESTAMP.search(line)
     if not m:
         return None
     try:
@@ -296,33 +329,46 @@ def check_openclaw_token_health() -> dict:
 
     recent = _read_recent_lines(OPENCLAW_LOG, OPENCLAW_SCAN_WINDOW_MINUTES)
 
-    format_errors = [line for line in recent if RE_FORMAT_ERROR.search(line)]
-    quota_failovers = [line for line in recent if RE_QUOTA_FAILOVER.search(line)]
+    # Self-check. If the log has content but NOTHING in the window carries a parseable
+    # timestamp, the format has drifted from what _parse_ts understands. That is not a
+    # cosmetic problem: the window degrades to "the whole file", so a long-past incident
+    # would be counted as happening now and could trigger a spurious kill. This exact
+    # breakage happened on 2026-08-11 when the log gained JSON lines, and it was invisible
+    # because a watchdog that matches nothing looks identical to a healthy system.
+    if recent and not any(_parse_ts(line) is not None for line in recent):
+        return degraded(
+            "Cannot parse timestamps in openclaw.log — the scan window is unbounded, so "
+            "kill thresholds are unreliable. Log format likely changed.",
+            fix="Update RE_TIMESTAMP / RE_JSON_TIMESTAMP in checks.py to match the current log format",
+        )
+
+    poison_loops = [line for line in recent if RE_POISON_LOOP.search(line)]
+    usage_caps = [line for line in recent if RE_USAGE_CAP.search(line)]
 
     counts = {
-        "format_error_loop": len(format_errors),
-        "quota_failover_cascade": len(quota_failovers),
+        "poison_loop": len(poison_loops),
+        "usage_cap": len(usage_caps),
     }
 
-    if len(format_errors) >= OPENCLAW_FORMAT_ERROR_THRESHOLD:
+    if len(poison_loops) >= OPENCLAW_FORMAT_ERROR_THRESHOLD:
         return {
             "status": "kill",
-            "detail": f"{len(format_errors)} gpt-5.4-pro format error retries in {OPENCLAW_SCAN_WINDOW_MINUTES} min",
-            "reason": "format_error_loop",
+            "detail": f"{len(poison_loops)} schema-rejection retries in {OPENCLAW_SCAN_WINDOW_MINUTES} min (poison-pill loop burning tokens)",
+            "reason": "poison_loop",
             "pattern_counts": counts,
-            "log_excerpts": format_errors[-10:],
+            "log_excerpts": poison_loops[-10:],
         }
 
-    if len(quota_failovers) >= OPENCLAW_QUOTA_FAILOVER_THRESHOLD:
-        return {
-            "status": "kill",
-            "detail": f"{len(quota_failovers)} quota-triggered failovers to gpt-5.4-pro in {OPENCLAW_SCAN_WINDOW_MINUTES} min",
-            "reason": "quota_failover_cascade",
-            "pattern_counts": counts,
-            "log_excerpts": quota_failovers[-10:],
-        }
+    # Deliberately degraded, NOT kill. The provider is already refusing requests, so spend
+    # has stopped on its own; killing Mandy would cost Rick his assistant and save nothing.
+    if len(usage_caps) >= OPENCLAW_QUOTA_FAILOVER_THRESHOLD:
+        return degraded(
+            f"{len(usage_caps)} provider refusals in {OPENCLAW_SCAN_WINDOW_MINUTES} min — "
+            "Anthropic Console spend cap reached. Spend has already stopped.",
+            fix="Raise the cap in Anthropic Console (Settings > Limits), or wait for the reset stated in the log line",
+        )
 
-    return ok(f"{counts['format_error_loop']} format errors, {counts['quota_failover_cascade']} quota failovers in last {OPENCLAW_SCAN_WINDOW_MINUTES} min")
+    return ok(f"{counts['poison_loop']} poison-loop retries, {counts['usage_cap']} provider refusals in last {OPENCLAW_SCAN_WINDOW_MINUTES} min")
 
 
 CHECKS = {
