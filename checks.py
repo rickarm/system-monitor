@@ -25,7 +25,11 @@ RE_TIMESTAMP = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.\d+([+-]\d{2
 # regex above cannot see them. Without this, _parse_ts returns None for every modern line,
 # _read_recent_lines never breaks out of its loop, and the "last 60 minutes" window silently
 # becomes "the entire file" — turning any historical match into a present-tense kill signal.
-RE_JSON_TIMESTAMP = re.compile(r'"time":"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.\d+([+-]\d{2}:\d{2})"')
+# `\s*` after the colon is deliberate. The gateway emits compact JSON (`"time":"..."`), but
+# any re-serialisation of a log line through a default json.dumps produces `"time": "..."`
+# with a space, and a watchdog that silently stops parsing on a whitespace change is the
+# whole failure mode this rewrite exists to prevent.
+RE_JSON_TIMESTAMP = re.compile(r'"time":\s*"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.\d+([+-]\d{2}:\d{2})"')
 
 # Poison-pill loop: the agent retries a request the provider keeps rejecting, burning tokens
 # with no output. This is the real "runaway" signal and the only one worth killing over.
