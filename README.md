@@ -18,6 +18,7 @@ Mac mini service health monitor with AI-powered reasoning via Claude Agent SDK.
 | openclaw | launchd service loaded + PID alive |
 | peloton-sync | Last log entry is success + <8 days old |
 | git-pull-repos | Last run had failed=0 |
+| zoom-jobs | No Zoom job stalled >3h mid-pipeline or >26h awaiting Zoom's transcript; no failure in the last 7 days |
 
 ## Setup
 
