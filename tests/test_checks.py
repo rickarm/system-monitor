@@ -10,20 +10,21 @@ from checks import (
     check_openclaw_token_health,
     check_peloton_sync,
     check_git_pull_repos,
+    check_zoom_jobs,
     CHECKS,
 )
 
 
 def test_checks_registry():
-    assert len(CHECKS) == 6
+    assert len(CHECKS) == 7
     assert set(CHECKS.keys()) == {
         "openclaw-tokens", "sherlock-hq", "sleep-watcher", "openclaw",
-        "peloton-sync", "git-pull-repos",
+        "peloton-sync", "git-pull-repos", "zoom-jobs",
     }
 
 
 def test_checks_registry_with_token_watchdog():
-    assert len(CHECKS) == 6
+    assert len(CHECKS) == 7
     keys = list(CHECKS.keys())
     assert "openclaw-tokens" in keys
     assert keys.index("openclaw-tokens") < keys.index("openclaw")
@@ -325,3 +326,69 @@ def test_openclaw_token_health_killed_marker(tmp_path):
     assert result["status"] == "killed"
     assert "format_error_loop" in result["detail"]
     assert "fix" in result
+
+
+def _zoom_db(tmp_path, rows):
+    import sqlite3
+    db = tmp_path / "jobs.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE jobs (id INTEGER, topic TEXT, state TEXT, updated_at TEXT)")
+    con.executemany("INSERT INTO jobs VALUES (?, ?, ?, ?)", rows)
+    con.commit()
+    con.close()
+    return db
+
+
+def _hours_ago(h):
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) - timedelta(hours=h)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_zoom_jobs_no_database_is_healthy(tmp_path):
+    with patch("checks.ZOOMSYNC_DB", tmp_path / "nope.db"):
+        assert check_zoom_jobs()["status"] == "healthy"
+
+
+def test_zoom_jobs_all_done_is_healthy(tmp_path):
+    db = _zoom_db(tmp_path, [(1, "Brett <> Rick", "done", _hours_ago(500))])
+    with patch("checks.ZOOMSYNC_DB", db):
+        assert check_zoom_jobs()["status"] == "healthy"
+
+
+def test_zoom_jobs_stuck_transcribing_is_degraded(tmp_path):
+    # The shape that lost job 8: parked in transcribing, nothing advancing it.
+    db = _zoom_db(tmp_path, [(8, "Brett <> Rick ", "transcribing", _hours_ago(5))])
+    with patch("checks.ZOOMSYNC_DB", db):
+        result = check_zoom_jobs()
+    assert result["status"] == "degraded"
+    assert "#8" in result["detail"] and "transcribing" in result["detail"]
+
+
+def test_zoom_jobs_recent_transcribing_is_healthy(tmp_path):
+    db = _zoom_db(tmp_path, [(8, "Brett <> Rick", "transcribing", _hours_ago(1))])
+    with patch("checks.ZOOMSYNC_DB", db):
+        assert check_zoom_jobs()["status"] == "healthy"
+
+
+def test_zoom_jobs_waiting_for_zoom_transcript_is_allowed_a_day(tmp_path):
+    # Zoom's VTT can land 5h+ after the call; that is normal, not stuck.
+    db = _zoom_db(tmp_path, [(10, "Vic <> Rick", "awaiting_zoom_transcript", _hours_ago(10))])
+    with patch("checks.ZOOMSYNC_DB", db):
+        assert check_zoom_jobs()["status"] == "healthy"
+
+
+def test_zoom_jobs_waiting_past_the_fallback_is_degraded(tmp_path):
+    db = _zoom_db(tmp_path, [(10, "Vic <> Rick", "awaiting_zoom_transcript", _hours_ago(30))])
+    with patch("checks.ZOOMSYNC_DB", db):
+        assert check_zoom_jobs()["status"] == "degraded"
+
+
+def test_zoom_jobs_recent_failure_is_degraded_old_one_is_not(tmp_path):
+    db = _zoom_db(tmp_path, [(4, "Kaitlyn <> Rick", "failed", _hours_ago(48))])
+    with patch("checks.ZOOMSYNC_DB", db):
+        assert check_zoom_jobs()["status"] == "degraded"
+    db2 = tmp_path / "old"
+    db2.mkdir()
+    db2 = _zoom_db(db2, [(4, "Kaitlyn <> Rick", "failed", _hours_ago(240))])
+    with patch("checks.ZOOMSYNC_DB", db2):
+        assert check_zoom_jobs()["status"] == "healthy"

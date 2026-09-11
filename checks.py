@@ -3,6 +3,7 @@
 import http.client
 import json
 import re
+import sqlite3
 import subprocess
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -13,6 +14,13 @@ PELOTON_SYNC_LOG = HOME / "scripts/logs/peloton-sync.log"
 GIT_PULL_LOG = HOME / "scripts/logs/git-pull-repos.log"
 OPENCLAW_LOG = HOME / "scripts/logs/openclaw.log"
 OPENCLAW_KILL_MARKER = HOME / "scripts/logs/openclaw-killed.marker"
+# zoomsync (~/Dev/transcribe) keeps its Zoom job queue here. Nothing schedules it:
+# Mandy runs zoom-transcribe.sh on demand, so a job that stalls just sits. Three
+# recordings were lost that way before anyone noticed (rickarm/transcribe#29).
+ZOOMSYNC_DB = HOME / ".local/state/transcribe-zoom/jobs.db"
+ZOOMSYNC_ACTIVE_STUCK_HOURS = 3  # a 76-min recording transcribes in ~12 min
+ZOOMSYNC_AWAITING_STUCK_HOURS = 26  # transcribe's transcript_timeout_min is 24h
+ZOOMSYNC_FAILED_LOOKBACK_DAYS = 7
 
 OPENCLAW_FORMAT_ERROR_THRESHOLD = 6
 OPENCLAW_QUOTA_FAILOVER_THRESHOLD = 4
@@ -65,6 +73,7 @@ SERVICE_CONTEXT = {
     "openclaw": "Mandy Telegram bot agent",
     "peloton-sync": "Peloton CSV / Airtable sync",
     "git-pull-repos": "Nightly git pull across all repos",
+    "zoom-jobs": "Zoom recording to WhisperX transcription queue (zoomsync)",
 }
 
 
@@ -375,6 +384,63 @@ def check_openclaw_token_health() -> dict:
     return ok(f"{counts['poison_loop']} poison-loop retries, {counts['usage_cap']} provider refusals in last {OPENCLAW_SCAN_WINDOW_MINUTES} min")
 
 
+def check_zoom_jobs() -> dict:
+    """Alarm on Zoom jobs that stalled mid-pipeline or failed recently.
+
+    A job only advances when something runs a poll, so "stuck" is judged by
+    how long since the row last changed. Waiting on Zoom's transcript is
+    legitimately slow (it can land 5h+ after the call), so that state gets a
+    threshold past zoomsync's own 24h fallback: beyond it, no poll has run to
+    fire the fallback at all.
+    """
+    if not ZOOMSYNC_DB.exists():
+        return ok("No zoomsync job database yet")
+    try:
+        con = sqlite3.connect(f"file:{ZOOMSYNC_DB}?mode=ro", uri=True, timeout=5)
+        try:
+            rows = con.execute(
+                "SELECT id, topic, state, updated_at FROM jobs"
+            ).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error as e:
+        return degraded(
+            f"Cannot read {ZOOMSYNC_DB}: {e}",
+            fix="Check ~/.local/state/transcribe-zoom/ exists and is readable",
+        )
+
+    now = datetime.now(timezone.utc)
+    problems = []
+    for job_id, topic, state, updated_at in rows:
+        try:
+            updated = datetime.fromisoformat((updated_at or "").replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        age_h = (now - updated).total_seconds() / 3600
+        label = f"#{job_id} {(topic or '').strip()!r} {state} {age_h:.1f}h"
+        if state == "failed":
+            flagged = age_h <= ZOOMSYNC_FAILED_LOOKBACK_DAYS * 24
+        elif state == "awaiting_zoom_transcript":
+            flagged = age_h > ZOOMSYNC_AWAITING_STUCK_HOURS
+        else:
+            flagged = (
+                state not in ("done", "whisperx_only")
+                and age_h > ZOOMSYNC_ACTIVE_STUCK_HOURS
+            )
+        if flagged:
+            problems.append(label)
+
+    if problems:
+        return degraded(
+            f"{len(problems)} Zoom job(s) stuck or failed: " + "; ".join(problems[:3]),
+            fix="~/Dev/transcribe/zoom-transcribe.sh status, then replay <id> "
+            "(see rickarm/transcribe#29)",
+        )
+    return ok(f"{len(rows)} Zoom job(s), none stuck")
+
+
 CHECKS = {
     "openclaw-tokens": check_openclaw_token_health,
     "sherlock-hq": check_sherlock_hq,
@@ -382,4 +448,5 @@ CHECKS = {
     "openclaw": check_openclaw,
     "peloton-sync": check_peloton_sync,
     "git-pull-repos": check_git_pull_repos,
+    "zoom-jobs": check_zoom_jobs,
 }
