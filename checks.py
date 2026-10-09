@@ -441,11 +441,12 @@ def check_zoom_jobs() -> dict:
     return ok(f"{len(rows)} Zoom job(s), none stuck")
 
 
+# "openclaw-tokens" and "openclaw" were removed 2026-10-09 when Mandy was retired
+# (Sherlock-llc/openclaw-config#42). Their check functions stay in this module so
+# rollback is re-adding the two entries.
 CHECKS = {
-    "openclaw-tokens": check_openclaw_token_health,
     "sherlock-hq": check_sherlock_hq,
     "sleep-watcher": check_sleep_watcher,
-    "openclaw": check_openclaw,
     "peloton-sync": check_peloton_sync,
     "git-pull-repos": check_git_pull_repos,
     "zoom-jobs": check_zoom_jobs,
