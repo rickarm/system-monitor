@@ -16,18 +16,17 @@ from checks import (
 
 
 def test_checks_registry():
-    assert len(CHECKS) == 7
+    assert len(CHECKS) == 5
     assert set(CHECKS.keys()) == {
-        "openclaw-tokens", "sherlock-hq", "sleep-watcher", "openclaw",
+        "sherlock-hq", "sleep-watcher",
         "peloton-sync", "git-pull-repos", "zoom-jobs",
     }
 
 
-def test_checks_registry_with_token_watchdog():
-    assert len(CHECKS) == 7
-    keys = list(CHECKS.keys())
-    assert "openclaw-tokens" in keys
-    assert keys.index("openclaw-tokens") < keys.index("openclaw")
+def test_checks_registry_excludes_retired_openclaw():
+    # Mandy retired 2026-10-09 (Sherlock-llc/openclaw-config#42).
+    assert "openclaw" not in CHECKS
+    assert "openclaw-tokens" not in CHECKS
 
 
 @patch("checks.http.client.HTTPConnection")
