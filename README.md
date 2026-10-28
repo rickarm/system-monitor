@@ -35,9 +35,8 @@ bash install.sh
 
 ## Credentials
 
-Add to `~/.env`:
+Secrets live in the login keychain, loaded once from the 1Password `system-monitor` Environment:
 ```
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_CHAT_ID=...
-ANTHROPIC_API_KEY=...
+~/scripts/op-keychain-load.sh system-monitor <environment-id> TELEGRAM_BOT_TOKEN ANTHROPIC_API_KEY
 ```
+and `~/.env` holds the non-secret `TELEGRAM_CHAT_ID=...`.

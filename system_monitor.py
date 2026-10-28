@@ -25,11 +25,12 @@ from checks import CHECKS, SERVICE_CONTEXT, OPENCLAW_KILL_MARKER
 from state import load_state, save_state
 from telegram import send_telegram
 from reasoning import reason_sync
+from keychain import keychain_secret
 
 HOME = Path.home()
 LOG_FILE = HOME / "scripts/logs/system-monitor.log"
 STATE_FILE = HOME / "scripts/logs/system-monitor-state.json"
-ENV_FILE = HOME / ".env"
+ENV_FILE = HOME / ".env"  # non-secret config only (TELEGRAM_CHAT_ID, ALFRED_URL)
 
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -220,12 +221,12 @@ def execute_kill(check_result: dict, env: dict) -> None:
     # Alert via Alfred
     send_alfred_alert(
         alfred_url=env.get("ALFRED_URL", "http://127.0.0.1:8200"),
-        alfred_api_key=env.get("ALFRED_API_KEY", ""),
+        alfred_api_key=keychain_secret("infra-alerts", "ALFRED_API_KEY"),
         service="openclaw",
         transition="ok->down",
         detail=f"TOKEN WATCHDOG KILL: {detail}. Service unloaded from launchd. Manual restart required: rm ~/scripts/logs/openclaw-killed.marker && ~/scripts/start-openclaw.sh",
-        fallback_token=env.get("RICK_TELEGRAM_BOT_TOKEN", ""),
-        fallback_chat_id=env.get("RICK_TELEGRAM_CHAT_ID", ""),
+        fallback_token=keychain_secret("system-monitor", "TELEGRAM_BOT_TOKEN"),
+        fallback_chat_id=env.get("TELEGRAM_CHAT_ID", ""),
     )
 
     # Create GitHub issue
@@ -237,9 +238,9 @@ def main(dry_run: bool = False) -> None:
     log.info("=== system-monitor: %s%s ===", ts, " [DRY-RUN]" if dry_run else "")
 
     env = load_env(ENV_FILE)
-    telegram_token = env.get("TELEGRAM_BOT_TOKEN", "")
+    telegram_token = keychain_secret("system-monitor", "TELEGRAM_BOT_TOKEN")
     telegram_chat_id = env.get("TELEGRAM_CHAT_ID", "")
-    anthropic_key = env.get("ANTHROPIC_API_KEY", "")
+    anthropic_key = keychain_secret("system-monitor", "ANTHROPIC_API_KEY")
 
     if not dry_run and (not telegram_token or not telegram_chat_id):
         log.warning("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set — alerts disabled")
