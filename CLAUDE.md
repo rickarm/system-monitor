@@ -53,7 +53,7 @@ Claude is invoked via `claude-agent-sdk` with `model="claude-haiku-4-5"` only wh
 
 ## Credentials
 
-Reads from `~/.env`: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `ANTHROPIC_API_KEY`, `ALFRED_URL`, `ALFRED_API_KEY`, `RICK_TELEGRAM_BOT_TOKEN`, `RICK_TELEGRAM_CHAT_ID`
+Secrets come from the login keychain (`keychain.py`): `TELEGRAM_BOT_TOKEN` and `ANTHROPIC_API_KEY` under service `system-monitor` (loaded once from the 1Password Environment with `~/scripts/op-keychain-load.sh system-monitor <id> TELEGRAM_BOT_TOKEN ANTHROPIC_API_KEY`), `ALFRED_API_KEY` under service `infra-alerts`. `~/.env` supplies only non-secret config: `TELEGRAM_CHAT_ID`, `ALFRED_URL`. The job runs every 30 min, too often to call `op` per run (1,000 reads/day account limit).
 
 ## Gotchas
 
