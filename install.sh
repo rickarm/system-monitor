@@ -5,7 +5,8 @@
 # Prerequisites:
 #   1. Python venv created: python3 -m venv .venv
 #   2. Dependencies installed: .venv/bin/pip install -r requirements.txt
-#   3. ~/.env contains TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ANTHROPIC_API_KEY
+#   3. login keychain holds system-monitor/TELEGRAM_BOT_TOKEN and
+#      system-monitor/ANTHROPIC_API_KEY (op-keychain-load.sh); ~/.env has TELEGRAM_CHAT_ID
 #
 # Usage: bash install.sh
 
@@ -34,12 +35,12 @@ if ! "$SCRIPT_DIR/.venv/bin/python3" -c "import claude_agent_sdk" 2>/dev/null; t
 fi
 echo "✓ claude-agent-sdk installed"
 
-# 3. ~/.env credentials
+# 3. credentials: secrets in the login keychain, chat id in ~/.env
 if [ -f "$HOME/.env" ]; then
     missing=""
-    grep -q "TELEGRAM_BOT_TOKEN" "$HOME/.env" || missing="TELEGRAM_BOT_TOKEN "
+    /usr/bin/security find-generic-password -s system-monitor -a TELEGRAM_BOT_TOKEN >/dev/null 2>&1 || missing="keychain:system-monitor/TELEGRAM_BOT_TOKEN "
     grep -q "TELEGRAM_CHAT_ID" "$HOME/.env" || missing="${missing}TELEGRAM_CHAT_ID "
-    grep -q "ANTHROPIC_API_KEY" "$HOME/.env" || missing="${missing}ANTHROPIC_API_KEY"
+    /usr/bin/security find-generic-password -s system-monitor -a ANTHROPIC_API_KEY >/dev/null 2>&1 || missing="${missing}keychain:system-monitor/ANTHROPIC_API_KEY"
     if [ -z "$missing" ]; then
         echo "✓ ~/.env has all required credentials"
     else
